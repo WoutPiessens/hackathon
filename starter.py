@@ -42,44 +42,73 @@ def solve(instance: dict) -> dict:
 
     We have provided a trivial placeholder implementation that parks every flight at
     the first gate and staffs every task with the first team. It is only shape-valid.
-    Please replace the following with your own solver.
+    Please replace the followi  ng with your own solver.
     """
     # ---- REPLACE FROM HERE ------------------------------------------------
     # Trivial placeholder: parks every flight at the first gate and staffs each
     # task with the first team. It is only shape-valid.
     F = len(instance["FlightID"])
     G = len(instance["GateID"])
+    model = cp.Model()
 
     gate_used = cp.intvar(shape=F, lb=0, ub=G-1, name="gate_used")
 
-    model = cp.Model()
+
 
     # C1
 
     for f in range(F):
         for g in range(G):
             if instance["flight_arr"][f] < instance["gate_open"][g] or instance["flight_dep"][f] > instance["gate_close"][g]:
+
                 model += (gate_used[f] != g)
 
     # C2
-
     for f in range(F):
         for g in range(G):
-            if instance["flight_size"][f] == "wide" and instance["gate_size"][g] == "small":
+            if instance["flight_size"][f] == "wide" and instance["gate_stand_size"][g] == "small":
                 model += (gate_used[f] != g)
 
 
     # C3
+
 
     for f in range(F):
         for g in range(G):
             if instance["flight_op_type"][f] != instance["gate_op_type"][g] == "wide":
                 model += (gate_used[f] != g)
 
+    #C4
+
     for f in range(F):
         for g in range(G):
             if instance["flight_carrier"][f] != instance["gate_usage"][g] == "wide":
                 model += (gate_used[f] != g)
+
+
+    #C5
+
+    for g in range(G):
+        #existing_flights = [f for f in range(F) if gate_used[f] == g]
+        #model += cp.NoOverlapOptional([1,1], [2,2], [3,3], [True, False])
+        model += cp.NoOverlapOptional(start=[instance["flight_arr"][f] for f in range(F)],
+                                      duration=[instance["flight_dep"][f] - instance["flight_arr"][f] + 30 for f in range(F)] ,
+                                      end=[instance["flight_dep"][f] + 30 for f in range(F)],
+                                      is_present=[gate_used[f] == g for f in range(F)])
+
+
+
+    gate = []
+    task_start = []
+    task_labor = []
+    cost = []
+
+    if model.solve():
+        gate = gate_used.value()
+
+        gate = gate.tolist()
+
+
 
     """G0 = instance["GateID"][0]
     L0 = instance["LaborID"][0]
@@ -138,6 +167,8 @@ def solve_one(instance_path: Path, out_path: Path) -> None:
     missing = [k for k in REQUIRED_KEYS if k not in solution]
     if missing:
         sys.exit(f"solve() did not return required key(s): {missing}")
+
+    print(solution)
 
     dump_solution(solution, out_path)
     print(f"[{instance_path.name}] wrote {out_path} "
