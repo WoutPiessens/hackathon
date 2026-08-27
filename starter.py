@@ -25,6 +25,7 @@ import argparse
 import json
 import re
 import sys
+import time
 from pathlib import Path
 
 # =============================================================================
@@ -351,7 +352,28 @@ def _solve_at_unit(instance: dict, UNIT: int) -> dict | None:
 
     #model += (obj <= 14382)
 
-    if not model.solve():
+    # ---- intermediate-solution callback -------------------------------------
+    # CP-SAT hands back every improving solution it finds along the way, not
+    # just the last one. Print a one-line progress record for each so a long
+    # run reports what it is doing instead of sitting silent.
+    # NOTE: cost is a monotonically improving *incumbent* only once
+    # model.minimize(obj) below is enabled. As it stands the solve is pure
+    # satisfaction, so these are just the feasible solutions CP-SAT's parallel
+    # workers stumble on, and the printed cost jumps around rather than falling.
+    solve_started = time.perf_counter()
+    n_found = [0]
+
+    def on_solution() -> None:
+        n_found[0] += 1
+        print(
+            f"    [sol {n_found[0]:>3}] "
+            f"t={time.perf_counter() - solve_started:6.2f}s "
+            f"cost={obj.value()}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    if not model.solve(solver="ortools", display=on_solution):
         return None
 
     gate = gate_used.value()
