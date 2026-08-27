@@ -1,0 +1,60 @@
+[project]
+name = "acp26-hackathon"
+version = "0.1.0"
+description = "ACP Summer School 2026 airport scheduling hackathon"
+requires-python = ">=3.13"
+dependencies = [
+    "cpmpy>=0.9.24",
+    "minizinc>=0.10.0",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.14",
+    "ty>=0.0.1a25",
+]
+
+[tool.uv]
+package = false
+
+# --------------------------------------------------------------------------- #
+#  ruff
+# --------------------------------------------------------------------------- #
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "UP",   # pyupgrade
+    "B",    # bugbear
+    "SIM",  # flake8-simplify
+    "C4",   # comprehensions
+    "PTH",  # use pathlib
+    "RET",  # return cleanups
+    "PERF", # perflint
+    "RUF",
+]
+ignore = [
+    "E501",  # line length is handled by the formatter
+]
+
+[tool.ruff.lint.per-file-ignores]
+# The bundle puts your imports inside the "YOUR CODE" block, below the banner.
+"starter.py" = ["E402"]
+
+[tool.ruff.format]
+docstring-code-format = true
+
+# --------------------------------------------------------------------------- #
+#  ty
+# --------------------------------------------------------------------------- #
+[tool.ty.environment]
+python-version = "3.13"
+
+[tool.ty.src]
+exclude = ["data"]
