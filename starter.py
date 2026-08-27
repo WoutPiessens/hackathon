@@ -25,6 +25,7 @@ import argparse
 import json
 import re
 import sys
+import time
 from pathlib import Path
 
 # =============================================================================
@@ -281,9 +282,29 @@ def solve(instance: dict) -> dict:
     task_labor = []
     cost = []
 
-    model.minimize(cp.sum(instance["labor_cost"][t]*(cp.any(tasks_to_team == t)) for t in range(len(instance["LaborID"]))))
+    obj = cp.sum(instance["labor_cost"][t]*(cp.any(tasks_to_team == t)) for t in range(len(instance["LaborID"])))
+    model.minimize(obj)
 
-    if model.solve():
+    # ---- intermediate-solution callback -------------------------------------
+    # CP-SAT hands back every improving solution it finds along the way, not
+    # just the last one. Print a one-line progress record for each so a long
+    # run reports what it is doing instead of sitting silent.
+    # With minimise active these are improving incumbents, so cost falls
+    # monotonically; on a pure satisfaction solve it would jump around instead.
+    solve_started = time.perf_counter()
+    n_found = [0]
+
+    def on_solution() -> None:
+        n_found[0] += 1
+        print(
+            f"    [sol {n_found[0]:>3}] "
+            f"t={time.perf_counter() - solve_started:6.2f}s "
+            f"cost={obj.value()}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    if model.solve(solver="ortools", display=on_solution):
         gate = gate_used.value()
 
         gate = gate.tolist()
