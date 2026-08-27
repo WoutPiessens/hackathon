@@ -34,7 +34,26 @@ import cpmpy as cp
 
 
 def solve(instance: dict) -> dict:
-    """Build a solution for one instance.
+    """Solve one instance, coarsest time unit first.
+
+    A 5-minute grid shrinks the search space a lot, but the rounding is
+    conservative (see ``_solve_at_unit``) and on tight turnarounds it can round
+    a flight's critical path past its own window -- in which case there is no
+    coarse solution at all and we fall back to a finer grid. Whatever comes
+    back is valid against the original 1-minute model either way.
+    """
+    for unit in (5, 1):
+        solution = _solve_at_unit(instance, unit)
+        if solution is not None:
+            print(f"  solved on a {unit}-minute grid", file=sys.stderr)
+            return solution
+    return {"gate": [], "task_start": [], "task_labor": [], "cost": []}
+
+
+def _solve_at_unit(instance: dict, UNIT: int) -> dict | None:
+    """Build and solve one instance on a ``UNIT``-minute time grid.
+
+    Returns ``None`` if the (conservatively rounded) model is infeasible.
 
     ``instance`` is a dict loaded from an hackathon_XX.json file. It uses a FLAT
     schema: every per-flight / per-gate / per-team field is a top-level array
@@ -51,16 +70,53 @@ def solve(instance: dict) -> dict:
     G = len(instance["GateID"])
     model = cp.Model()
 
+    # ---- Coarse time granularity -------------------------------------------
+    # The whole model is built in UNIT-minute buckets: a coarse time t stands
+    # for minute t * UNIT. Every quantity is rounded in the SAFE direction so
+    # that any coarse solution, scaled back by *UNIT, satisfies the original
+    # 1-minute model:
+    #   * things that must FIT inside a window (availability) are SHRUNK --
+    #     lower bounds round up, upper bounds round down;
+    #   * things that must be COVERED (durations, required gaps, travel) are
+    #     GROWN -- they always round up.
+    # This is conservative, never optimistic: it can only lose solutions, never
+    # admit an invalid one. UNIT = 1 reproduces the original model exactly.
+
+    def dn(x: int) -> int:
+        """Round a minute value DOWN to a whole UNIT bucket."""
+        return x // UNIT
+
+    def up(x: int) -> int:
+        """Round a minute value UP to a whole UNIT bucket."""
+        return -(-x // UNIT)
+
+    # Per flight, two coarse views of [flight_arr, flight_dep]:
+    #  - the OCCUPANCY view (C1/C5) must cover the real stay, so it is widened;
+    #  - the TASK-WINDOW view (C7) must sit inside the real stay, so it shrinks.
+    occ_arr = [dn(instance["flight_arr"][f]) for f in range(F)]   # <= real arr
+    occ_dep = [up(instance["flight_dep"][f]) for f in range(F)]   # >= real dep
+    win_arr = [up(instance["flight_arr"][f]) for f in range(F)]   # >= real arr
+    win_dep = [dn(instance["flight_dep"][f]) for f in range(F)]   # <= real dep
+
+    # Gate opening hours and crew shifts are windows to fit inside -> shrink.
+    gate_open_c = [up(o) for o in instance["gate_open"]]
+    gate_close_c = [dn(c) for c in instance["gate_close"]]
+    shift_start_c = [up(t) for t in instance["labor_shift_start"]]
+    shift_end_c = [dn(t) for t in instance["labor_shift_end"]]
+
+    # Durations and the C5 inter-turn gap are things to cover -> grow.
+    min_gate_gap_c = up(30)
+    horizon_c = dn(instance["horizon"])
+
     gate_used = cp.intvar(shape=F, lb=0, ub=G - 1, name="gate_used")
 
     # C1
 
     for f in range(F):
         for g in range(G):
-            if (
-                instance["flight_arr"][f] < instance["gate_open"][g]
-                or instance["flight_dep"][f] > instance["gate_close"][g]
-            ):
+            # widened stay vs. shrunk opening hours: implies the real
+            # [arr, dep] also fits inside the real [open, close].
+            if occ_arr[f] < gate_open_c[g] or occ_dep[f] > gate_close_c[g]:
 
                 model += gate_used[f] != g
 
@@ -93,12 +149,11 @@ def solve(instance: dict) -> dict:
         # existing_flights = [f for f in range(F) if gate_used[f] == g]
         # model += cp.NoOverlapOptional([1,1], [2,2], [3,3], [True, False])
         model += cp.NoOverlapOptional(
-            start=[instance["flight_arr"][f] for f in range(F)],
+            start=[occ_arr[f] for f in range(F)],
             duration=[
-                instance["flight_dep"][f] - instance["flight_arr"][f] + 30
-                for f in range(F)
+                occ_dep[f] - occ_arr[f] + min_gate_gap_c for f in range(F)
             ],
-            end=[instance["flight_dep"][f] + 30 for f in range(F)],
+            end=[occ_dep[f] + min_gate_gap_c for f in range(F)],
             is_present=[gate_used[f] == g for f in range(F)],
         )
 
@@ -173,13 +228,17 @@ def solve(instance: dict) -> dict:
             return preds_international_passenger
         return preds_domestic_passenger
 
-    flattened_task_starts = cp.intvar(shape=sum(instance["flight_n_tasks"]), lb=0, ub=24 * 60)
+    flattened_task_starts = cp.intvar(
+        shape=sum(instance["flight_n_tasks"]), lb=0, ub=horizon_c
+    )
     tasks_to_team = cp.intvar(
         shape=sum(instance["flight_n_tasks"]),
         lb=0,
         ub=len(instance["LaborID"]) - 1,  # TODO really big domain
     )
-    flattened_tasks = [b for a in instance["flight_tasks"] for b in a]
+    flattened_tasks = [b for a in instance["flight_tasks"] for b in a if b["duration"] > 0]
+    # Same flattening, but with each duration rounded UP to whole buckets.
+    flattened_dur_c = [up(t["duration"]) for t in flattened_tasks]
     # for each of the flights
     for flight_index, f in enumerate(range(F)):
 
@@ -187,7 +246,9 @@ def solve(instance: dict) -> dict:
         flight_n_tasks_start = sum(instance["flight_n_tasks"][:flight_index])
         flight_n_tasks_end = flight_n_tasks_start + instance["flight_n_tasks"][f]
         for t in range(flight_n_tasks_start, flight_n_tasks_end):
-            model += (flattened_task_starts[t] >= instance["flight_arr"][f]) & (flattened_task_starts[t] + flattened_tasks[t]["duration"] <= instance["flight_dep"][f])
+            model += (flattened_task_starts[t] >= win_arr[f]) & (
+                flattened_task_starts[t] + flattened_dur_c[t] <= win_dep[f]
+            )
 
 
         if instance["flight_op_type"][f] == "passenger":
@@ -202,7 +263,11 @@ def solve(instance: dict) -> dict:
             for v in flight_precedence_graph[k]:
                 task_index_k = next(i for i, task in enumerate(required_tasks) if task["kind"] == k)
                 task_index_v = next(i for i, task in enumerate(required_tasks) if task["kind"] == v)
-                model += flattened_task_starts[flight_n_tasks_start + task_index_k] >= flattened_task_starts[flight_n_tasks_start + task_index_v] + flattened_tasks[flight_n_tasks_start + task_index_v]["duration"]
+                model += (
+                    flattened_task_starts[flight_n_tasks_start + task_index_k]
+                    >= flattened_task_starts[flight_n_tasks_start + task_index_v]
+                    + flattened_dur_c[flight_n_tasks_start + task_index_v]
+                )
 
 
 
@@ -224,7 +289,8 @@ def solve(instance: dict) -> dict:
         # 2. retrieve from the graph the predecessors of that task kind
         # 3. enforce predecessor task must be of task kind that we just retrieved
 
-        for task_index, task in enumerate(required_tasks):
+        for task_index in range(instance["flight_n_tasks"][f]):
+            task = required_tasks[task_index]
             task_kind = task["kind"]
             team_type_that_can_do_task = task_to_team_type_map[task_kind]
             team_indexes_that_can_do_kind = [
@@ -234,9 +300,7 @@ def solve(instance: dict) -> dict:
             ]
             team_index_start_that_can_do_kind = team_indexes_that_can_do_kind[0]
             team_index_end_that_can_do_kind = team_indexes_that_can_do_kind[-1]
-            print("Flight tasks to team: ", flight_tasks_to_team)
-            print("Task index: ", task_index)
-            print("Required tasks: ", required_tasks)
+
             # only the right team can do the task
             model += (
                 team_index_start_that_can_do_kind <= flight_tasks_to_team[task_index]
@@ -246,7 +310,7 @@ def solve(instance: dict) -> dict:
 
     for task_index, _ in enumerate(instance["LaborID"]):
         flattened_tasks_1 = [flattened_tasks[i] for i in range(len(flattened_task_starts))]
-        flattened_task_durations = [a["duration"] for a in flattened_tasks_1]
+        flattened_task_durations = flattened_dur_c[: len(flattened_tasks_1)]
         # enforce no overlap for those tasks
         model += cp.NoOverlapOptional(
             start=flattened_task_starts,
@@ -270,10 +334,10 @@ def solve(instance: dict) -> dict:
 
         x = tasks_to_team[task_id]
 
-        model += flattened_task_starts[task_id] >= cp.Element(instance["labor_shift_start"], x)
+        model += flattened_task_starts[task_id] >= cp.Element(shift_start_c, x)
 
-        model += flattened_task_starts[task_id] + task["duration"] <= cp.Element(
-            instance["labor_shift_end"], x
+        model += flattened_task_starts[task_id] + flattened_dur_c[task_id] <= cp.Element(
+            shift_end_c, x
         )
 
     gate = []
@@ -281,32 +345,39 @@ def solve(instance: dict) -> dict:
     task_labor = []
     cost = []
 
-    model.minimize(cp.sum(instance["labor_cost"][t]*(cp.any(tasks_to_team == t)) for t in range(len(instance["LaborID"]))))
+    obj = cp.sum(instance["labor_cost"][t]*(cp.any(tasks_to_team == t)) for t in range(len(instance["LaborID"])))
 
-    if model.solve():
-        gate = gate_used.value()
+    #model.minimize(obj)
 
-        gate = gate.tolist()
+    #model += (obj <= 14382)
 
-        gate = [instance["GateID"][g] for g in gate]
+    if not model.solve():
+        return None
 
-        task_labor_flat = tasks_to_team.value().tolist()
-        task_start_flat = flattened_task_starts.value().tolist()
+    gate = gate_used.value()
 
-        start = 0
-        task_labor = []
-        task_start = []
+    gate = gate.tolist()
 
-        for size in instance['flight_n_tasks']:
-            task_labor.append(task_labor_flat[start:start + size])
-            task_start.append(task_start_flat[start:start + size])
-            start += size
+    gate = [instance["GateID"][g] for g in gate]
 
-        task_labor = [[instance["LaborID"][l] for l in sublist] for sublist in task_labor]
-        cost = model.objective_value()
+    task_labor_flat = tasks_to_team.value().tolist()
+    # Back from UNIT-minute buckets to the 1-minute units the grader wants.
+    task_start_flat = [t * UNIT for t in flattened_task_starts.value().tolist()]
+
+    start = 0
+    task_labor = []
+    task_start = []
+
+    for size in instance['flight_n_tasks']:
+        task_labor.append(task_labor_flat[start:start + size])
+        task_start.append(task_start_flat[start:start + size])
+        start += size
+
+    task_labor = [[instance["LaborID"][l] for l in sublist] for sublist in task_labor]
+    cost = obj.value()
 
 
-        #print(task_starts, tasks_to_team_1)
+    #print(task_starts, tasks_to_team_1)
 
     """G0 = instance["GateID"][0]
     L0 = instance["LaborID"][0]
