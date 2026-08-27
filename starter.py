@@ -348,7 +348,7 @@ def _solve_at_unit(instance: dict, UNIT: int) -> dict | None:
 
     obj = cp.sum(instance["labor_cost"][t]*(cp.any(tasks_to_team == t)) for t in range(len(instance["LaborID"])))
 
-    #model.minimize(obj)
+    model.minimize(obj)
 
     #model += (obj <= 14382)
 
@@ -356,10 +356,8 @@ def _solve_at_unit(instance: dict, UNIT: int) -> dict | None:
     # CP-SAT hands back every improving solution it finds along the way, not
     # just the last one. Print a one-line progress record for each so a long
     # run reports what it is doing instead of sitting silent.
-    # NOTE: cost is a monotonically improving *incumbent* only once
-    # model.minimize(obj) below is enabled. As it stands the solve is pure
-    # satisfaction, so these are just the feasible solutions CP-SAT's parallel
-    # workers stumble on, and the printed cost jumps around rather than falling.
+    # With minimise active these are improving incumbents, so cost falls
+    # monotonically; on a pure satisfaction solve it would jump around instead.
     solve_started = time.perf_counter()
     n_found = [0]
 
