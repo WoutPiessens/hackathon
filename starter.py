@@ -193,9 +193,7 @@ def solve(
             return preds_international_passenger
         return preds_domestic_passenger
 
-    flattened_task_starts = cp.intvar(
-        shape=sum(instance["flight_n_tasks"]), lb=0, ub=24 * 60
-    )
+    d1_task_starts = cp.intvar(shape=sum(instance["flight_n_tasks"]), lb=0, ub=24 * 60)
     tasks_to_team = cp.intvar(
         shape=sum(instance["flight_n_tasks"]),
         lb=0,
@@ -238,6 +236,7 @@ def solve(
         ]
         for task in flattened_tasks
     ]
+    travel_intervals = {}
     # for each of the flights
     for flight_index, f in enumerate(range(F)):
 
@@ -247,8 +246,8 @@ def solve(
         # C7: every active task stays inside its flight window.
         if enabled("C7"):
             for t in range(flight_n_tasks_start, flight_n_tasks_end):
-                model += (flattened_task_starts[t] >= instance["flight_arr"][f]) & (
-                    flattened_task_starts[t] + flattened_tasks[t]["duration"]
+                model += (d1_task_starts[t] >= instance["flight_arr"][f]) & (
+                    d1_task_starts[t] + flattened_tasks[t]["duration"]
                     <= instance["flight_dep"][f]
                 )
 
@@ -271,8 +270,8 @@ def solve(
                         i for i, task in enumerate(required_tasks) if task["kind"] == v
                     )
                     model += (
-                        flattened_task_starts[flight_n_tasks_start + task_index_k]
-                        >= flattened_task_starts[flight_n_tasks_start + task_index_v]
+                        d1_task_starts[flight_n_tasks_start + task_index_k]
+                        >= d1_task_starts[flight_n_tasks_start + task_index_v]
                         + flattened_tasks[flight_n_tasks_start + task_index_v][
                             "duration"
                         ]
@@ -313,84 +312,43 @@ def solve(
                 )
 
             # index of
-
-    # C9: each individual team can work on at most one task at a time.
-    if enabled("C9"):
-        flattened_task_durations = [
-            flattened_tasks[i]["duration"] for i in range(len(flattened_task_starts))
-        ]
-
-        for team_index, _ in enumerate(instance["LaborID"]):
-            possible_task_ids = [
-                task_id
-                for task_id in range(len(flattened_tasks))
-                if not enabled("C6") or team_index in task_to_possible_teams[task_id]
-            ]
-            # enforce no overlap for those tasks
-            model += cp.NoOverlapOptional(
-                start=[flattened_task_starts[i] for i in possible_task_ids],
-                duration=[flattened_task_durations[i] for i in possible_task_ids],
-                end=[
-                    flattened_task_starts[i] + flattened_task_durations[i]
-                    for i in possible_task_ids
-                ],
-                is_present=[
-                    tasks_to_team[task_id] == team_index
-                    for task_id in possible_task_ids
-                ],
-            )
-
-    # enforce tasks are within shift start end
-    # C10: a task must fit within its assigned team's shift.
-    if enabled("C10"):
-        for task_id, task in enumerate(flattened_tasks):
-
-            x = tasks_to_team[task_id]
-
-            model += flattened_task_starts[task_id] >= cp.Element(
-                instance["labor_shift_start"], x
-            )
-
-            model += flattened_task_starts[task_id] + task["duration"] <= cp.Element(
-                instance["labor_shift_end"], x
-            )
     # Travel time and task-chain constraints
     if enabled("C11"):
-        # first_task[l, t] is true iff t is the first task in team l's chain.
-        # last_task[l, t] is true iff t is the last task in team l's chain.
+        # Use one edge variable per task pair rather than one per
+        # (team, task pair). The selected edge itself says which team owns
+        # both tasks, so this is equivalent but much smaller.
+        precedes = {}
         first_task = {}
         last_task = {}
-        precedes = {}
 
-        for team_index, compatible_tasks in enumerate(team_to_possible_tasks):
-            # If C6 is disabled, allow C11 to consider every possible assignment.
-            if not enabled("C6"):
-                compatible_tasks = list(range(len(flattened_tasks)))
+        for task in range(len(flattened_tasks)):
+            first_task[task] = cp.boolvar(name=f"first_{task}")
+            last_task[task] = cp.boolvar(name=f"last_{task}")
 
-            for task in compatible_tasks:
-                first_task[team_index, task] = cp.boolvar(
-                    name=f"first_{team_index}_{task}"
+        for predecessor in range(len(flattened_tasks)):
+            for successor in range(len(flattened_tasks)):
+                if predecessor == successor:
+                    continue
+
+                # With C6 active, tasks of different required team kinds can
+                # never share a team, so those edges are unnecessary.
+                if enabled("C6") and not set(
+                    task_to_possible_teams[predecessor]
+                ).intersection(task_to_possible_teams[successor]):
+                    continue
+
+                precedes[predecessor, successor] = cp.boolvar(
+                    name=f"precedes_{predecessor}_{successor}"
                 )
-                last_task[team_index, task] = cp.boolvar(
-                    name=f"last_{team_index}_{task}"
-                )
-
-            for predecessor in compatible_tasks:
-                for successor in compatible_tasks:
-                    if predecessor != successor:
-                        precedes[team_index, predecessor, successor] = cp.boolvar(
-                            name=f"precedes_{team_index}_{predecessor}_{successor}"
-                        )
 
         # An active precedence edge means:
-        # 1. both tasks are assigned to this team;
+        # 1. both tasks are assigned to the same team;
         # 2. predecessor finishes, then travel occurs, then successor starts.
-        for (team_index, predecessor, successor), edge in precedes.items():
-            assigned_predecessor = tasks_to_team[predecessor] == team_index
-            assigned_successor = tasks_to_team[successor] == team_index
-
-            # Both predecessor and successor must be assigned to the team for the edge to be active.
-            model += edge.implies(assigned_predecessor & assigned_successor)
+        for (predecessor, successor), edge in precedes.items():
+            # Both tasks must be assigned to the same team.
+            model += edge.implies(
+                tasks_to_team[predecessor] == tasks_to_team[successor]
+            )
 
             # task_to_gate contains CP variables, so use NDElement rather
             # than indexing instance["travel"] directly.
@@ -402,60 +360,96 @@ def solve(
                 ],
             )
 
+            # Model travel as an optional activity on this team's timeline.
+            # It starts when the predecessor task finishes and is present
+            # exactly when this precedence edge is selected.
+            travel_start = (
+                d1_task_starts[predecessor] + task_duration[predecessor]
+            )
+            travel_end = travel_start + travel_time
+            travel_intervals[predecessor, successor] = (
+                travel_start,
+                travel_time,
+                travel_end,
+                edge,
+            )
+
             # If the edge is active, enforce the timing constraint: predecessor finishes, then travel occurs, then successor starts.
             model += edge.implies(
-                flattened_task_starts[successor]
-                >= flattened_task_starts[predecessor]
-                + task_duration[predecessor]
-                + travel_time
+                travel_end <= d1_task_starts[successor]
             )
 
-        # Force all tasks assigned to a team to form one path.
-        for team_index, compatible_tasks in enumerate(team_to_possible_tasks):
-            if not enabled("C6"):
-                compatible_tasks = list(range(len(flattened_tasks)))
+        # Every task belongs to exactly one chain: it has exactly one incoming
+        # edge unless it is first, and exactly one outgoing edge unless it is
+        # last.
+        for task in range(len(flattened_tasks)):
+            incoming = [
+                precedes[predecessor, task]
+                for predecessor in range(len(flattened_tasks))
+                if (predecessor, task) in precedes
+            ]
+            outgoing = [
+                precedes[task, successor]
+                for successor in range(len(flattened_tasks))
+                if (task, successor) in precedes
+            ]
 
+            model += (cp.sum(incoming) if incoming else 0) + first_task[task] == 1
+            model += (cp.sum(outgoing) if outgoing else 0) + last_task[task] == 1
+
+        # Since each selected edge connects tasks assigned to the same team,
+        # require exactly one first and one last task for every used team.
+        for team_index in range(len(instance["LaborID"])):
             used = cp.any(tasks_to_team == team_index)
 
-            if not compatible_tasks:
-                model += ~used
-                continue
+            model += cp.sum(
+                first_task[task] & (tasks_to_team[task] == team_index)
+                for task in range(len(flattened_tasks))
+            ) == used
 
-            for task in compatible_tasks:
-                assigned = tasks_to_team[task] == team_index
+            model += cp.sum(
+                last_task[task] & (tasks_to_team[task] == team_index)
+                for task in range(len(flattened_tasks))
+            ) == used
 
-                incoming = [
-                    precedes[team_index, predecessor, task]
-                    for predecessor in compatible_tasks
-                    if predecessor != task
-                ]
+    # C9: each individual team can work on at most one task at a time.
+    if enabled("C9"):
+        for team_index, _ in enumerate(instance["LaborID"]):
+            possible_task_ids = [
+                task_id
+                for task_id in range(len(flattened_tasks))
+                if not enabled("C6") or team_index in task_to_possible_teams[task_id]
+            ]
 
-                outgoing = [
-                    precedes[team_index, task, successor]
-                    for successor in compatible_tasks
-                    if successor != task
-                ]
+            starts = [d1_task_starts[t] for t in possible_task_ids]
+            durations = [task_duration[t] for t in possible_task_ids]
+            ends = [d1_task_starts[t] + task_duration[t] for t in possible_task_ids]
+            present = [tasks_to_team[t] == team_index for t in possible_task_ids]
 
-                # Every assigned task has exactly one predecessor,
-                # unless it is the first task.
-                model += (cp.sum(incoming) if incoming else 0) + first_task[
-                    team_index, task
-                ] == assigned
-
-                # Every assigned task has exactly one successor,
-                # unless it is the last task.
-                model += (cp.sum(outgoing) if outgoing else 0) + last_task[
-                    team_index, task
-                ] == assigned
-
-            # A used team has exactly one first task and one last task.
-            model += (
-                cp.sum(first_task[team_index, task] for task in compatible_tasks)
-                == used
+            # Do not add every possible travel interval here: that would make
+            # NoOverlapOptional compare O(E^2) pairs of optional edges. Once
+            # C11 selects one chain, its travel inequalities already order the
+            # selected travel intervals between the corresponding task pairs.
+            model += cp.NoOverlapOptional(
+                start=starts,
+                duration=durations,
+                end=ends,
+                is_present=present,
             )
 
-            model += (
-                cp.sum(last_task[team_index, task] for task in compatible_tasks) == used
+    # enforce tasks are within shift start end
+    # C10: a task must fit within its assigned team's shift.
+    if enabled("C10"):
+        for task_id, task in enumerate(flattened_tasks):
+
+            x = tasks_to_team[task_id]
+
+            model += d1_task_starts[task_id] >= cp.Element(
+                instance["labor_shift_start"], x
+            )
+
+            model += d1_task_starts[task_id] + task["duration"] <= cp.Element(
+                instance["labor_shift_end"], x
             )
 
     # Breaks
@@ -519,7 +513,7 @@ def solve(
         gate = [instance["GateID"][g] for g in gate]
 
         task_labor_values = tasks_to_team.value()
-        task_start_values = flattened_task_starts.value()
+        task_start_values = d1_task_starts.value()
         task_labor_flat = (
             [0] * len(flattened_tasks)
             if task_labor_values is None
