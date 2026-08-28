@@ -400,6 +400,23 @@ def solve(
         predecessor_gate_options = [0, *list(task_to_gate)]
         predecessor_rank_options = [0, *list(chain_rank)]
 
+        # With C6 enabled, tasks linked in one team chain must require the
+        # same team kind. Link predecessor choices to this static information
+        # directly instead of waiting for the weaker task-team equality below
+        # to propagate through a variable Element expression.
+        if enabled("C6"):
+            required_kind_codes = {
+                kind: code
+                for code, kind in enumerate(sorted(set(task_required_team_kind)))
+            }
+            task_required_kind_codes = [
+                required_kind_codes[kind] for kind in task_required_team_kind
+            ]
+            predecessor_kind_options = [
+                -1,
+                *task_required_kind_codes,
+            ]
+
         # Keep the predecessor-dependent travel expression available for C12.
         travel_to_task = {}
 
@@ -416,6 +433,15 @@ def solve(
             model += (predecessor[task] != 0).implies(
                 tasks_to_team[task] == predecessor_team
             )
+
+            if enabled("C6"):
+                predecessor_required_kind = cp.Element(
+                    predecessor_kind_options,
+                    predecessor[task],
+                )
+                model += (predecessor[task] != 0).implies(
+                    predecessor_required_kind == task_required_kind_codes[task]
+                )
 
             predecessor_end = cp.Element(
                 predecessor_end_options,
