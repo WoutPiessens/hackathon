@@ -41,6 +41,7 @@ def solve(
     timing: dict[str, object] | None = None,
     time_limit: float | None = None,
     solver_options: dict[str, object] | None = None,
+    build_only: bool = False,
 ) -> dict:
     """Build a solution for one instance.
 
@@ -199,7 +200,7 @@ def solve(
         lb=0,
         ub=len(instance["LaborID"]) - 1,  # TODO really big domain
     )
-    flattened_tasks = [
+    d1_tasks = [
         task
         for tasks, task_count in zip(
             instance["flight_tasks"], instance["flight_n_tasks"], strict=True
@@ -212,18 +213,16 @@ def solve(
         for _ in range(task_count)
     ]
 
-    task_duration = [task["duration"] for task in flattened_tasks]
+    task_duration = [task["duration"] for task in d1_tasks]
 
-    task_required_team_kind = [
-        task_to_team_type_map[task["kind"]] for task in flattened_tasks
-    ]
+    task_required_team_kind = [task_to_team_type_map[task["kind"]] for task in d1_tasks]
 
     task_to_gate = [gate_used[flight_index] for flight_index in task_to_flight]
     # Task <-> Team mappings
     team_to_possible_tasks = [
         [
             task_index
-            for task_index, task in enumerate(flattened_tasks)
+            for task_index, task in enumerate(d1_tasks)
             if task_to_team_type_map[task["kind"]] == instance["labor_kind"][team_index]
         ]
         for team_index in range(len(instance["LaborID"]))
@@ -234,9 +233,8 @@ def solve(
             for i, team in enumerate(instance["labor_kind"])
             if task_to_team_type_map[task["kind"]] == team
         ]
-        for task in flattened_tasks
+        for task in d1_tasks
     ]
-    travel_intervals = {}
     # for each of the flights
     for flight_index, f in enumerate(range(F)):
 
@@ -247,7 +245,7 @@ def solve(
         if enabled("C7"):
             for t in range(flight_n_tasks_start, flight_n_tasks_end):
                 model += (d1_task_starts[t] >= instance["flight_arr"][f]) & (
-                    d1_task_starts[t] + flattened_tasks[t]["duration"]
+                    d1_task_starts[t] + d1_tasks[t]["duration"]
                     <= instance["flight_dep"][f]
                 )
 
@@ -272,9 +270,7 @@ def solve(
                     model += (
                         d1_task_starts[flight_n_tasks_start + task_index_k]
                         >= d1_task_starts[flight_n_tasks_start + task_index_v]
-                        + flattened_tasks[flight_n_tasks_start + task_index_v][
-                            "duration"
-                        ]
+                        + d1_tasks[flight_n_tasks_start + task_index_v]["duration"]
                     )
 
         flight_tasks_to_team = tasks_to_team[flight_n_tasks_start:flight_n_tasks_end]
@@ -312,114 +308,111 @@ def solve(
                 )
 
             # index of
-    # Travel time and task-chain constraints
+    # C11: represent each team's chain with one predecessor index per task.
     if enabled("C11"):
-        # Use one edge variable per task pair rather than one per
-        # (team, task pair). The selected edge itself says which team owns
-        # both tasks, so this is equivalent but much smaller.
-        precedes = {}
-        first_task = {}
-        last_task = {}
+        n_tasks = len(d1_tasks)
 
-        for task in range(len(flattened_tasks)):
-            first_task[task] = cp.boolvar(name=f"first_{task}")
-            last_task[task] = cp.boolvar(name=f"last_{task}")
+        # predecessor[t] == 0 means t is first in its team's chain.
+        # predecessor[t] == p + 1 means p immediately precedes t.
+        predecessor = cp.intvar(
+            shape=n_tasks,
+            lb=0,
+            ub=n_tasks,
+            name="predecessor",
+        )
+        if timing is not None:
+            timing["c11_predecessor_vars"] = n_tasks
 
-        for predecessor in range(len(flattened_tasks)):
-            for successor in range(len(flattened_tasks)):
-                if predecessor == successor:
-                    continue
+        # A task can be the predecessor of at most one other task.
+        model += cp.AllDifferentExcept0(predecessor)
 
-                # With C6 active, tasks of different required team kinds can
-                # never share a team, so those edges are unnecessary.
-                if enabled("C6") and not set(
-                    task_to_possible_teams[predecessor]
-                ).intersection(task_to_possible_teams[successor]):
-                    continue
+        # These arrays are shared by all Element expressions below. Building
+        # a fresh length-N list inside the task loop would reintroduce O(N^2)
+        # Python/CPMPy construction work.
+        chain_rank = cp.intvar(
+            shape=n_tasks,
+            lb=0,
+            ub=n_tasks,
+            name="chain_rank",
+        )
+        predecessor_team_options = [0, *list(tasks_to_team)]
+        predecessor_end_options = [
+            0,
+            *[d1_task_starts[p] + task_duration[p] for p in range(n_tasks)],
+        ]
+        predecessor_gate_options = [0, *list(task_to_gate)]
+        predecessor_rank_options = [0, *list(chain_rank)]
 
-                precedes[predecessor, successor] = cp.boolvar(
-                    name=f"precedes_{predecessor}_{successor}"
-                )
+        # Keep the predecessor-dependent travel expression available for C12.
+        travel_to_task = {}
 
-        # An active precedence edge means:
-        # 1. both tasks are assigned to the same team;
-        # 2. predecessor finishes, then travel occurs, then successor starts.
-        for (predecessor, successor), edge in precedes.items():
-            # Both tasks must be assigned to the same team.
-            model += edge.implies(
-                tasks_to_team[predecessor] == tasks_to_team[successor]
+        for task in range(n_tasks):
+            # Prevent a task from being its own predecessor.
+            model += predecessor[task] != task + 1
+
+            predecessor_team = cp.Element(
+                predecessor_team_options,
+                predecessor[task],
             )
 
-            # task_to_gate contains CP variables, so use NDElement rather
-            # than indexing instance["travel"] directly.
+            # A selected predecessor and its successor must use the same team.
+            model += (predecessor[task] != 0).implies(
+                tasks_to_team[task] == predecessor_team
+            )
+
+            predecessor_end = cp.Element(
+                predecessor_end_options,
+                predecessor[task],
+            )
+            predecessor_gate = cp.Element(
+                predecessor_gate_options,
+                predecessor[task],
+            )
             travel_time = cp.NDElement(
                 instance["travel"],
-                [
-                    task_to_gate[predecessor],
-                    task_to_gate[successor],
-                ],
+                [predecessor_gate, task_to_gate[task]],
+            )
+            travel_to_task[task] = travel_time
+
+            # The task starts after its predecessor finishes and the team
+            # travels to the task's gate.
+            model += (predecessor[task] != 0).implies(
+                d1_task_starts[task] >= predecessor_end + travel_time
             )
 
-            # Model travel as an optional activity on this team's timeline.
-            # It starts when the predecessor task finishes and is present
-            # exactly when this precedence edge is selected.
-            travel_start = d1_task_starts[predecessor] + task_duration[predecessor]
-            travel_end = travel_start + travel_time
-            travel_intervals[predecessor, successor] = (
-                travel_start,
-                travel_time,
-                travel_end,
-                edge,
+        # Ranks make the chain acyclic even if a future instance has zero
+        # duration tasks and zero travel times.
+        for task in range(n_tasks):
+            predecessor_rank = cp.Element(
+                predecessor_rank_options,
+                predecessor[task],
+            )
+            model += (predecessor[task] != 0).implies(
+                chain_rank[task] > predecessor_rank
             )
 
-            # If the edge is active, enforce the timing constraint: predecessor finishes, then travel occurs, then successor starts.
-            model += edge.implies(travel_end <= d1_task_starts[successor])
-
-        # Every task belongs to exactly one chain: it has exactly one incoming
-        # edge unless it is first, and exactly one outgoing edge unless it is
-        # last.
-        for task in range(len(flattened_tasks)):
-            incoming = [
-                precedes[predecessor, task]
-                for predecessor in range(len(flattened_tasks))
-                if (predecessor, task) in precedes
-            ]
-            outgoing = [
-                precedes[task, successor]
-                for successor in range(len(flattened_tasks))
-                if (task, successor) in precedes
-            ]
-
-            model += (cp.sum(incoming) if incoming else 0) + first_task[task] == 1
-            model += (cp.sum(outgoing) if outgoing else 0) + last_task[task] == 1
-
-        # Since each selected edge connects tasks assigned to the same team,
-        # require exactly one first and one last task for every used team.
+        # Exactly one task starts each used team's chain. Together with
+        # AllDifferentExcept0, same-team links, and ranks, this forces all
+        # tasks assigned to a team to form one path.
         for team_index in range(len(instance["LaborID"])):
             used = cp.any(tasks_to_team == team_index)
-
             model += (
                 cp.sum(
-                    first_task[task] & (tasks_to_team[task] == team_index)
-                    for task in range(len(flattened_tasks))
-                )
-                == used
-            )
-
-            model += (
-                cp.sum(
-                    last_task[task] & (tasks_to_team[task] == team_index)
-                    for task in range(len(flattened_tasks))
+                    (predecessor[task] == 0) & (tasks_to_team[task] == team_index)
+                    for task in range(n_tasks)
                 )
                 == used
             )
 
     # C9: each individual team can work on at most one task at a time.
-    if enabled("C9"):
+    # When C11 is enabled, the predecessor-chain constraints already impose
+    # this ordering (and add travel time), so constructing another large set
+    # of optional no-overlap occurrences would be redundant.
+    if enabled("C9") and not enabled("C11"):
         for team_index, _ in enumerate(instance["LaborID"]):
             possible_task_ids = [
                 task_id
-                for task_id in range(len(flattened_tasks))
+                for task_id in range(len(d1_tasks))
                 if not enabled("C6") or team_index in task_to_possible_teams[task_id]
             ]
 
@@ -442,7 +435,7 @@ def solve(
     # enforce tasks are within shift start end
     # C10: a task must fit within its assigned team's shift.
     if enabled("C10"):
-        for task_id, task in enumerate(flattened_tasks):
+        for task_id, task in enumerate(d1_tasks):
 
             x = tasks_to_team[task_id]
 
@@ -455,8 +448,55 @@ def solve(
             )
 
     # Breaks
-    if enabled("C12"):
-        pass
+    # C12 requires the predecessor chain from C11.
+    if enabled("C12") and enabled("C11"):
+        n_tasks = len(d1_tasks)
+
+        # Start time of this task's current work streak.
+        streak_start = cp.intvar(
+            shape=n_tasks,
+            lb=0,
+            ub=24 * 60,
+            name="streak_start",
+        )
+
+        # Index 0 is the dummy predecessor.
+        predecessor_streak_options = [0, *list(streak_start)]
+
+        for task in range(n_tasks):
+            p = predecessor[task]
+
+            predecessor_streak_start = cp.Element(
+                predecessor_streak_options,
+                p,
+            )
+
+            predecessor_end = cp.Element(
+                predecessor_end_options,
+                p,
+            )
+
+            # Travel is not counted as rest.
+            idle_after_travel = (
+                d1_task_starts[task] - predecessor_end - travel_to_task[task]
+            )
+
+            is_first = predecessor[task] == 0
+            has_rest = idle_after_travel >= 15
+
+            model += is_first.implies(streak_start[task] == d1_task_starts[task])
+
+            model += ((predecessor[task] != 0) & has_rest).implies(
+                streak_start[task] == d1_task_starts[task]
+            )
+
+            model += ((predecessor[task] != 0) & ~has_rest).implies(
+                streak_start[task] == predecessor_streak_start
+            )
+
+            # Based on the specification: a task may not START
+            # more than 90 minutes after the streak began.
+            model += d1_task_starts[task] <= streak_start[task] + 90
 
     gate = []
     task_start = []
@@ -492,6 +532,14 @@ def solve(
     if timing is not None:
         timing["build_s"] = time.perf_counter() - build_started
 
+    # Profiling hook: return after CPMPy model construction, before backend
+    # translation, presolve, search, and solution decoding.
+    if build_only:
+        if timing is not None:
+            timing["solver_s"] = 0.0
+            timing["solver_status"] = "build_only"
+        return {}
+
     solve_kwargs: dict[str, object] = {"solver": "ortools"}
     if time_limit is not None:
         solve_kwargs["time_limit"] = time_limit
@@ -516,16 +564,16 @@ def solve(
 
         task_labor_values = tasks_to_team.value()
         task_start_values = d1_task_starts.value()
-        task_labor_flat = (
-            [0] * len(flattened_tasks)
+        d1_task_labor = (
+            [0] * len(d1_tasks)
             if task_labor_values is None
             else [
                 0 if value is None else int(value)
                 for value in task_labor_values.tolist()
             ]
         )
-        task_start_flat = (
-            [0] * len(flattened_tasks)
+        d1_task_start = (
+            [0] * len(d1_tasks)
             if task_start_values is None
             else [
                 0 if value is None else int(value)
@@ -538,8 +586,8 @@ def solve(
         task_start = []
 
         for size in instance["flight_n_tasks"]:
-            task_labor.append(task_labor_flat[start : start + size])
-            task_start.append(task_start_flat[start : start + size])
+            task_labor.append(d1_task_labor[start : start + size])
+            task_start.append(d1_task_start[start : start + size])
             start += size
 
         task_labor = [
@@ -563,10 +611,7 @@ def solve(
         task_labor.append([L0] * len(tasks))   # one team id per task
 
     cost = 0"""
-    for team_index in []:
-        # variable on start times of tasks
-        # variable on what tasks
-        pass
+
     # ---- REPLACE UNTIL HERE -----------------------------------------------
     return {
         "gate": gate,
