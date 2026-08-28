@@ -231,6 +231,67 @@ def solve(
         ]
         for task in d1_tasks
     ]
+
+    # Symmetry breaking for interchangeable teams. These attributes cover
+    # every team-specific constraint and the objective in this model.
+    team_used = cp.boolvar(
+        shape=len(instance["LaborID"]),
+        name="team_used",
+    )
+    for team_index in range(len(instance["LaborID"])):
+        model += team_used[team_index] == cp.any(
+            tasks_to_team == team_index
+        )
+
+    team_groups = {}
+    for team_index in range(len(instance["LaborID"])):
+        signature = (
+            instance["labor_kind"][team_index],
+            instance["labor_shift_start"][team_index],
+            instance["labor_shift_end"][team_index],
+            instance["labor_cost"][team_index],
+        )
+        team_groups.setdefault(signature, []).append(team_index)
+
+    for group in team_groups.values():
+        for lower_team, higher_team in zip(group, group[1:]):
+            # Interchangeable teams are used in index order.
+            model += team_used[higher_team] <= team_used[lower_team]
+
+    # Gate symmetry is safe only when the gates have the same attributes and
+    # the same travel row. The travel row is needed for C11/C12 interchangeability.
+    gate_groups = {}
+    for gate_index in range(G):
+        signature = (
+            instance["gate_stand_size"][gate_index],
+            instance["gate_usage"][gate_index],
+            instance["gate_op_type"][gate_index],
+            instance["gate_open"][gate_index],
+            instance["gate_close"][gate_index],
+            tuple(instance["travel"][gate_index]),
+        )
+        gate_groups.setdefault(signature, []).append(gate_index)
+
+    duplicate_gate_groups = [
+        group for group in gate_groups.values() if len(group) > 1
+    ]
+    if duplicate_gate_groups:
+        gate_used_by_any_flight = cp.boolvar(
+            shape=G,
+            name="gate_used_by_any_flight",
+        )
+        for gate_index in range(G):
+            model += gate_used_by_any_flight[gate_index] == cp.any(
+                gate_used == gate_index
+            )
+
+        for group in duplicate_gate_groups:
+            for lower_gate, higher_gate in zip(group, group[1:]):
+                model += (
+                    gate_used_by_any_flight[higher_gate]
+                    <= gate_used_by_any_flight[lower_gate]
+                )
+
     # for each of the flights
     for flight_index, f in enumerate(range(F)):
 
@@ -391,7 +452,7 @@ def solve(
         # AllDifferentExcept0, same-team links, and ranks, this forces all
         # tasks assigned to a team to form one path.
         for team_index in range(len(instance["LaborID"])):
-            used = cp.any(tasks_to_team == team_index)
+            used = team_used[team_index]
             model += (
                 cp.sum(
                     (predecessor[task] == 0) & (tasks_to_team[task] == team_index)
@@ -500,7 +561,7 @@ def solve(
     cost = []
 
     obj = cp.sum(
-        instance["labor_cost"][t] * (cp.any(tasks_to_team == t))
+        instance["labor_cost"][t] * team_used[t]
         for t in range(len(instance["LaborID"]))
     )
     if enabled("OBJ"):
