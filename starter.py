@@ -363,9 +363,7 @@ def solve(
             # Model travel as an optional activity on this team's timeline.
             # It starts when the predecessor task finishes and is present
             # exactly when this precedence edge is selected.
-            travel_start = (
-                d1_task_starts[predecessor] + task_duration[predecessor]
-            )
+            travel_start = d1_task_starts[predecessor] + task_duration[predecessor]
             travel_end = travel_start + travel_time
             travel_intervals[predecessor, successor] = (
                 travel_start,
@@ -375,9 +373,7 @@ def solve(
             )
 
             # If the edge is active, enforce the timing constraint: predecessor finishes, then travel occurs, then successor starts.
-            model += edge.implies(
-                travel_end <= d1_task_starts[successor]
-            )
+            model += edge.implies(travel_end <= d1_task_starts[successor])
 
         # Every task belongs to exactly one chain: it has exactly one incoming
         # edge unless it is first, and exactly one outgoing edge unless it is
@@ -402,15 +398,21 @@ def solve(
         for team_index in range(len(instance["LaborID"])):
             used = cp.any(tasks_to_team == team_index)
 
-            model += cp.sum(
-                first_task[task] & (tasks_to_team[task] == team_index)
-                for task in range(len(flattened_tasks))
-            ) == used
+            model += (
+                cp.sum(
+                    first_task[task] & (tasks_to_team[task] == team_index)
+                    for task in range(len(flattened_tasks))
+                )
+                == used
+            )
 
-            model += cp.sum(
-                last_task[task] & (tasks_to_team[task] == team_index)
-                for task in range(len(flattened_tasks))
-            ) == used
+            model += (
+                cp.sum(
+                    last_task[task] & (tasks_to_team[task] == team_index)
+                    for task in range(len(flattened_tasks))
+                )
+                == used
+            )
 
     # C9: each individual team can work on at most one task at a time.
     if enabled("C9"):
@@ -497,7 +499,7 @@ def solve(
         solve_kwargs["display"] = on_solution
     if solver_options:
         solve_kwargs.update(solver_options)
-    solved = model.solve(**solve_kwargs)
+    solved = model.solve(**solve_kwargs)  # ty: ignore[invalid-argument-type]
     if timing is not None:
         timing["solver_s"] = time.perf_counter() - solve_started
         timing["solver_status"] = (
