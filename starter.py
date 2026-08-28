@@ -94,11 +94,7 @@ def solve(
     if enabled("C3"):
         for f in range(F):
             for g in range(G):
-                if (
-                    instance["flight_op_type"][f]
-                    != instance["gate_op_type"][g]
-                    == "wide"
-                ):
+                if instance["flight_op_type"][f] != instance["gate_op_type"][g]:
                     model += gate_used[f] != g
 
     # C4
@@ -106,7 +102,7 @@ def solve(
     if enabled("C4"):
         for f in range(F):
             for g in range(G):
-                if instance["flight_carrier"][f] != instance["gate_usage"][g] == "wide":
+                if instance["flight_carrier"][f] != instance["gate_usage"][g]:
                     model += gate_used[f] != g
 
     # C5
