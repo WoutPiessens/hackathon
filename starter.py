@@ -93,7 +93,11 @@ def solve(
     if enabled("C3"):
         for f in range(F):
             for g in range(G):
-                if instance["flight_op_type"][f] != instance["gate_op_type"][g] == "wide":
+                if (
+                    instance["flight_op_type"][f]
+                    != instance["gate_op_type"][g]
+                    == "wide"
+                ):
                     model += gate_used[f] != g
 
     # C4
@@ -204,6 +208,36 @@ def solve(
         )
         for task in tasks[:task_count]
     ]
+    task_to_flight = [
+        flight_index
+        for flight_index, task_count in enumerate(instance["flight_n_tasks"])
+        for _ in range(task_count)
+    ]
+
+    task_duration = [task["duration"] for task in flattened_tasks]
+
+    task_required_team_kind = [
+        task_to_team_type_map[task["kind"]] for task in flattened_tasks
+    ]
+
+    task_to_gate = [gate_used[flight_index] for flight_index in task_to_flight]
+    # Task <-> Team mappings
+    team_to_possible_tasks = [
+        [
+            task_index
+            for task_index, task in enumerate(flattened_tasks)
+            if task_to_team_type_map[task["kind"]] == instance["labor_kind"][team_index]
+        ]
+        for team_index in range(len(instance["LaborID"]))
+    ]
+    task_to_possible_teams = [
+        [
+            i
+            for i, team in enumerate(instance["labor_kind"])
+            if task_to_team_type_map[task["kind"]] == team
+        ]
+        for task in flattened_tasks
+    ]
     # for each of the flights
     for flight_index, f in enumerate(range(F)):
 
@@ -228,7 +262,7 @@ def solve(
 
         # C8: precedence within a flight.
         if enabled("C8"):
-            for k in flight_precedence_graph.keys():
+            for k in flight_precedence_graph:
                 for v in flight_precedence_graph[k]:
                     task_index_k = next(
                         i for i, task in enumerate(required_tasks) if task["kind"] == k
@@ -239,7 +273,9 @@ def solve(
                     model += (
                         flattened_task_starts[flight_n_tasks_start + task_index_k]
                         >= flattened_task_starts[flight_n_tasks_start + task_index_v]
-                        + flattened_tasks[flight_n_tasks_start + task_index_v]["duration"]
+                        + flattened_tasks[flight_n_tasks_start + task_index_v][
+                            "duration"
+                        ]
                     )
 
         flight_tasks_to_team = tasks_to_team[flight_n_tasks_start:flight_n_tasks_end]
@@ -261,16 +297,20 @@ def solve(
         # C6: task/team kind compatibility.
         if enabled("C6"):
             for task_index, task in enumerate(required_tasks):
-                team_indexes_that_can_do_kind = [
-                    i for i, team in enumerate(instance["labor_kind"])
+                possible_teams = [
+                    i
+                    for i, team in enumerate(instance["labor_kind"])
                     if task_to_team_type_map[task["kind"]] == team
                 ]
-                team_index_start_that_can_do_kind = team_indexes_that_can_do_kind[0]
-                team_index_end_that_can_do_kind = team_indexes_that_can_do_kind[-1]
+                team_index_start_that_can_do_kind = possible_teams[0]
+                team_index_end_that_can_do_kind = possible_teams[-1]
                 # only the right team can do the task
                 model += (
-                    team_index_start_that_can_do_kind <= flight_tasks_to_team[task_index]
-                ) & (flight_tasks_to_team[task_index] <= team_index_end_that_can_do_kind)
+                    team_index_start_that_can_do_kind
+                    <= flight_tasks_to_team[task_index]
+                ) & (
+                    flight_tasks_to_team[task_index] <= team_index_end_that_can_do_kind
+                )
 
             # index of
 
@@ -279,19 +319,12 @@ def solve(
         flattened_task_durations = [
             flattened_tasks[i]["duration"] for i in range(len(flattened_task_starts))
         ]
-        team_indexes_by_task = [
-            [
-                i
-                for i, team in enumerate(instance["labor_kind"])
-                if task_to_team_type_map[task["kind"]] == team
-            ]
-            for task in flattened_tasks
-        ]
+
         for team_index, _ in enumerate(instance["LaborID"]):
             possible_task_ids = [
                 task_id
                 for task_id in range(len(flattened_tasks))
-                if not enabled("C6") or team_index in team_indexes_by_task[task_id]
+                if not enabled("C6") or team_index in task_to_possible_teams[task_id]
             ]
             # enforce no overlap for those tasks
             model += cp.NoOverlapOptional(
@@ -321,6 +354,113 @@ def solve(
             model += flattened_task_starts[task_id] + task["duration"] <= cp.Element(
                 instance["labor_shift_end"], x
             )
+    # Travel time and task-chain constraints
+    if enabled("C11"):
+        # first_task[l, t] is true iff t is the first task in team l's chain.
+        # last_task[l, t] is true iff t is the last task in team l's chain.
+        first_task = {}
+        last_task = {}
+        precedes = {}
+
+        for team_index, compatible_tasks in enumerate(team_to_possible_tasks):
+            # If C6 is disabled, allow C11 to consider every possible assignment.
+            if not enabled("C6"):
+                compatible_tasks = list(range(len(flattened_tasks)))
+
+            for task in compatible_tasks:
+                first_task[team_index, task] = cp.boolvar(
+                    name=f"first_{team_index}_{task}"
+                )
+                last_task[team_index, task] = cp.boolvar(
+                    name=f"last_{team_index}_{task}"
+                )
+
+            for predecessor in compatible_tasks:
+                for successor in compatible_tasks:
+                    if predecessor != successor:
+                        precedes[team_index, predecessor, successor] = cp.boolvar(
+                            name=f"precedes_{team_index}_{predecessor}_{successor}"
+                        )
+
+        # An active precedence edge means:
+        # 1. both tasks are assigned to this team;
+        # 2. predecessor finishes, then travel occurs, then successor starts.
+        for (team_index, predecessor, successor), edge in precedes.items():
+            assigned_predecessor = tasks_to_team[predecessor] == team_index
+            assigned_successor = tasks_to_team[successor] == team_index
+
+            # Both predecessor and successor must be assigned to the team for the edge to be active.
+            model += edge.implies(assigned_predecessor & assigned_successor)
+
+            # task_to_gate contains CP variables, so use NDElement rather
+            # than indexing instance["travel"] directly.
+            travel_time = cp.NDElement(
+                instance["travel"],
+                [
+                    task_to_gate[predecessor],
+                    task_to_gate[successor],
+                ],
+            )
+
+            # If the edge is active, enforce the timing constraint: predecessor finishes, then travel occurs, then successor starts.
+            model += edge.implies(
+                flattened_task_starts[successor]
+                >= flattened_task_starts[predecessor]
+                + task_duration[predecessor]
+                + travel_time
+            )
+
+        # Force all tasks assigned to a team to form one path.
+        for team_index, compatible_tasks in enumerate(team_to_possible_tasks):
+            if not enabled("C6"):
+                compatible_tasks = list(range(len(flattened_tasks)))
+
+            used = cp.any(tasks_to_team == team_index)
+
+            if not compatible_tasks:
+                model += ~used
+                continue
+
+            for task in compatible_tasks:
+                assigned = tasks_to_team[task] == team_index
+
+                incoming = [
+                    precedes[team_index, predecessor, task]
+                    for predecessor in compatible_tasks
+                    if predecessor != task
+                ]
+
+                outgoing = [
+                    precedes[team_index, task, successor]
+                    for successor in compatible_tasks
+                    if successor != task
+                ]
+
+                # Every assigned task has exactly one predecessor,
+                # unless it is the first task.
+                model += (cp.sum(incoming) if incoming else 0) + first_task[
+                    team_index, task
+                ] == assigned
+
+                # Every assigned task has exactly one successor,
+                # unless it is the last task.
+                model += (cp.sum(outgoing) if outgoing else 0) + last_task[
+                    team_index, task
+                ] == assigned
+
+            # A used team has exactly one first task and one last task.
+            model += (
+                cp.sum(first_task[team_index, task] for task in compatible_tasks)
+                == used
+            )
+
+            model += (
+                cp.sum(last_task[team_index, task] for task in compatible_tasks) == used
+            )
+
+    # Breaks
+    if enabled("C12"):
+        pass
 
     gate = []
     task_start = []
@@ -366,7 +506,9 @@ def solve(
     solved = model.solve(**solve_kwargs)
     if timing is not None:
         timing["solver_s"] = time.perf_counter() - solve_started
-        timing["solver_status"] = str(model.status().exitstatus).rsplit(".", 1)[-1].lower()
+        timing["solver_status"] = (
+            str(model.status().exitstatus).rsplit(".", 1)[-1].lower()
+        )
 
     if solved:
         gate_values = gate_used.value()
@@ -381,12 +523,18 @@ def solve(
         task_labor_flat = (
             [0] * len(flattened_tasks)
             if task_labor_values is None
-            else [0 if value is None else int(value) for value in task_labor_values.tolist()]
+            else [
+                0 if value is None else int(value)
+                for value in task_labor_values.tolist()
+            ]
         )
         task_start_flat = (
             [0] * len(flattened_tasks)
             if task_start_values is None
-            else [0 if value is None else int(value) for value in task_start_values.tolist()]
+            else [
+                0 if value is None else int(value)
+                for value in task_start_values.tolist()
+            ]
         )
 
         start = 0
