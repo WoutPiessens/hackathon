@@ -446,7 +446,7 @@ def solve(
     # Breaks
     # C12 requires the predecessor chain from C11.
     if enabled("C12") and enabled("C11"):
-        n_tasks = len(d1_tasks)
+        n_tasks = len(d1_task_starts)
 
         # Start time of this task's current work streak.
         streak_start = cp.intvar(
