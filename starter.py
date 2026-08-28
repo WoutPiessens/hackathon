@@ -386,19 +386,27 @@ def solve(
         # These arrays are shared by all Element expressions below. Building
         # a fresh length-N list inside the task loop would reintroduce O(N^2)
         # Python/CPMPy construction work.
-        chain_rank = cp.intvar(
-            shape=n_tasks,
-            lb=0,
-            ub=n_tasks,
-            name="chain_rank",
-        )
         predecessor_team_options = [0, *list(tasks_to_team)]
         predecessor_end_options = [
             0,
             *[d1_task_starts[p] + task_duration[p] for p in range(n_tasks)],
         ]
         predecessor_gate_options = [0, *list(task_to_gate)]
-        predecessor_rank_options = [0, *list(chain_rank)]
+
+        # All supplied active tasks have positive duration and travel times
+        # are nonnegative, so every selected predecessor edge strictly
+        # increases time. Cycles are therefore already impossible and a
+        # separate rank variable is unnecessary. Keep a fallback for a future
+        # instance containing zero-duration tasks.
+        use_chain_rank = any(duration <= 0 for duration in task_duration)
+        if use_chain_rank:
+            chain_rank = cp.intvar(
+                shape=n_tasks,
+                lb=0,
+                ub=n_tasks,
+                name="chain_rank",
+            )
+            predecessor_rank_options = [0, *list(chain_rank)]
 
         # With C6 enabled, tasks linked in one team chain must require the
         # same team kind. Link predecessor choices to this static information
@@ -463,29 +471,41 @@ def solve(
                 d1_task_starts[task] >= predecessor_end + travel_time
             )
 
-        # Ranks make the chain acyclic even if a future instance has zero
-        # duration tasks and zero travel times.
+        if use_chain_rank:
+            # Fallback for instances with zero-duration tasks.
+            for task in range(n_tasks):
+                predecessor_rank = cp.Element(
+                    predecessor_rank_options,
+                    predecessor[task],
+                )
+                model += (predecessor[task] != 0).implies(
+                    chain_rank[task] > predecessor_rank
+                )
+
+        # A non-root task points to exactly one predecessor. AllDifferentExcept0
+        # gives every task at most one successor. With acyclicity from positive
+        # durations, every component is a path. Require the root team IDs to be
+        # distinct, while using a sentinel for non-root tasks; this gives at
+        # most one chain root per team without a teams x tasks sum.
+        first_team = cp.intvar(
+            shape=n_tasks,
+            lb=0,
+            ub=len(instance["LaborID"]),
+            name="first_team",
+        )
         for task in range(n_tasks):
-            predecessor_rank = cp.Element(
-                predecessor_rank_options,
-                predecessor[task],
+            is_first = predecessor[task] == 0
+            model += is_first.implies(
+                first_team[task] == tasks_to_team[task]
             )
-            model += (predecessor[task] != 0).implies(
-                chain_rank[task] > predecessor_rank
+            model += (~is_first).implies(
+                first_team[task] == len(instance["LaborID"])
             )
 
-        # Exactly one task starts each used team's chain. Together with
-        # AllDifferentExcept0, same-team links, and ranks, this forces all
-        # tasks assigned to a team to form one path.
-        for team_index in range(len(instance["LaborID"])):
-            used = team_used[team_index]
-            model += (
-                cp.sum(
-                    (predecessor[task] == 0) & (tasks_to_team[task] == team_index)
-                    for task in range(n_tasks)
-                )
-                == used
-            )
+        model += cp.AllDifferentExceptN(
+            first_team,
+            len(instance["LaborID"]),
+        )
 
     # C9: each individual team can work on at most one task at a time.
     # When C11 is enabled, the predecessor-chain constraints already impose
